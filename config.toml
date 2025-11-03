@@ -1,0 +1,24 @@
+[backend]
+name = "vllm"
+concurrency = 10
+endpoint = "http://localhost:8000"
+endpoint_api_key = "api-key"
+timeout = 60 # Request timeout in seconds
+max_retries = 3
+retry_delay = 1.0 # Delay between retries (exponential backoff)
+
+[model]
+name = "sxm4/24b-kto-final-merged-250720" # Leaderboard displayed name
+backend = "vllm"
+endpoint_model_name = "./models/24b-kto" #Model name as known by the backend
+max_tokens = 200 # Maximum tokens to generate, 50 is plenty for refusals and allows large batches
+
+[classifier]
+# Optional: Use external classifier API instead of local model
+# Leave api_endpoint empty to use local Transformers model
+api_endpoint = "http://localhost:8002"
+model = "./models/GLM-4.5-Air"
+concurrency = 10
+timeout = 30
+max_retries = 3
+retry_delay = 1.0
