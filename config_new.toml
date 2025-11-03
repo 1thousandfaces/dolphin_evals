@@ -12,9 +12,9 @@ retry_delay = 1.0
 batch_size = 50
 
 [model]
-name = "meta-llama/Llama-3-8B-Instruct"
+name = "msxm4/Tulu-SFT-KTO-405B"
 backend = "vllm"
-endpoint_model_name = "meta-llama/Llama-3-8B-Instruct"
+endpoint_model_name = "sxm4/Tulu-SFT-KTO-405B"
 max_tokens = 128
 
 [classifier]
