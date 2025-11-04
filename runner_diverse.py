@@ -1,233 +1,369 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-runner_diverse.py
-Thin wrapper around lm-evaluation-harness for "diverse evals".
+OpenBench + vLLM eval runner with:
+- batching via --max-connections (drives vLLM's dynamic batching)
+- graceful Ctrl+C (first SIGINT: finish current eval if possible; second: hard stop)
+- per-task JSON artifacts + consolidated JSON + markdown table
 
-- Uses vLLM's OpenAI-compatible endpoint via lm-eval's `openai-chat` model.
-- Sets OPENAI_API_BASE / OPENAI_API_KEY envs for you.
-- Batching: --batch_size auto (vLLM handles real concurrency).
-- Writes one summary JSON per run, plus per-benchmark result rows.
+Usage (examples):
+  python eval_runner.py \
+    --model vllm/meta-llama/Llama-3.1-8B-Instruct \
+    --base-url http://localhost:8000/v1 \
+    --out-dir runs/llama31-8b \
+    --batch 64 \
+    --temperature 0.0 \
+    --seed 0
 
-Usage:
-  python runner_diverse.py --config config.toml --set quick
-  python runner_diverse.py --config config.toml --benchmarks gsm8k hellaswag --limit 100
+You can subset tasks with --only or --skip (comma-separated names).
 """
 
-import argparse, json, logging, os, shlex, subprocess, sys, time
-from dataclasses import dataclass
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Any, Optional
 
-try:
-    import tomllib  # py311+
-except Exception:
-    import tomli as tomllib  # type: ignore
+# ---- Canonical OpenBench benchmark names (per docs) ----
+# Knowledge
+TASK_MMLU           = "mmlu"          # MMLU
+TASK_MMLU_PRO       = "mmlu_pro"      # MMLU-Pro
+TASK_GPQA_DIAMOND   = "gpqa_diamond"  # GPQA (graduate-level)
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
-log = logging.getLogger("runner_diverse")
+# HLE text-only (no vision)
+TASK_HLE_TEXT       = "hle_text"      # HLE_text
 
-# ---------------- Bench registry ----------------
+# Coding
+TASK_HUMANEVAL      = "humaneval"     # 164 problems
+TASK_JSONSCHEMABENCH= "jsonschemabench"
 
-BENCHMARKS = {
-    # Math & Reasoning
-    "gsm8k":        {"task": "gsm8k",        "metric": "exact_match", "fewshot": 5},
-    "arc_challenge":{"task": "arc_challenge","metric": "acc_norm",    "fewshot": 25},
-    "arc_easy":     {"task": "arc_easy",     "metric": "acc_norm",    "fewshot": 25},
-    # Commonsense
-    "hellaswag":    {"task": "hellaswag",    "metric": "acc_norm",    "fewshot": 10},
-    "winogrande":   {"task": "winogrande",   "metric": "acc",         "fewshot": 5},
-    "piqa":         {"task": "piqa",         "metric": "acc_norm",    "fewshot": 5},
-    # Truth / factuality
-    "truthfulqa_mc2":{"task":"truthfulqa_mc2","metric":"acc",         "fewshot": 0},
-    # Reading comp
-    "boolq":        {"task": "boolq",        "metric": "acc",         "fewshot": 0},
-    "squad_v2":     {"task": "squad_v2",     "metric": "exact",       "fewshot": 0},
-    # BBH subset (few-shot CoT variant in harness)
-    "bbh":          {"task": "bbh",          "metric": "acc",         "fewshot": 3},
-}
+# Math
+TASK_AIME_2023_I    = "aime_2023_I"
+TASK_AIME_2023_II   = "aime_2023_II"
+TASK_AIME_2024      = "aime_2024"     # Some builds also have I/II variants
+TASK_AIME_2024_I    = "aime_2024_I"
+TASK_AIME_2024_II   = "aime_2024_II"
+TASK_AIME_2025      = "aime_2025"
+TASK_AIME_2025_II   = "aime_2025_II"
+TASK_MATH_500       = "math_500"
 
-BENCHMARK_SETS = {
-    "quick":        ["gsm8k", "arc_challenge", "hellaswag", "truthfulqa_mc2"],
-    "reasoning":    ["gsm8k", "arc_challenge", "arc_easy", "bbh"],
-    "commonsense":  ["hellaswag", "winogrande", "piqa", "boolq"],
-    "comprehensive":["gsm8k","arc_challenge","hellaswag","winogrande","truthfulqa_mc2","boolq","piqa"],
-    "all":          list(BENCHMARKS.keys()),
-}
+# Reasoning / factuality
+TASK_SIMPLEQA       = "simpleqa"
 
-# ---------------- Config ----------------
+# Long-context retrieval
+TASK_MRCR           = "mrcr"          # OpenAI MRCR (multi-needle)
 
-@dataclass
-class Backend:
-    endpoint: str
-    endpoint_api_key: str = ""
+DEFAULT_TASKS = [
+    TASK_MMLU, TASK_MMLU_PRO, TASK_GPQA_DIAMOND,
+    TASK_HLE_TEXT,
+    TASK_HUMANEVAL, TASK_JSONSCHEMABENCH,
+    TASK_AIME_2023_I, TASK_AIME_2023_II,
+    TASK_AIME_2024, TASK_AIME_2024_I, TASK_AIME_2024_II,
+    TASK_AIME_2025, TASK_AIME_2025_II,
+    TASK_MATH_500,
+    TASK_SIMPLEQA,
+    TASK_MRCR,
+]
 
-@dataclass
-class Model:
-    name: str
-    endpoint_model_name: str = ""
+# Which tasks need a code sandbox (docker) for test execution?
+SANDBOX_NEEDED = {TASK_HUMANEVAL}
 
-def load_cfg(path: str) -> Dict[str, Any]:
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
-    b = data["backend"]; m = data["model"]
-    return {
-        "backend": Backend(endpoint=b["endpoint"], endpoint_api_key=b.get("endpoint_api_key","")),
-        "model":   Model(name=m["name"], endpoint_model_name=m.get("endpoint_model_name", m["name"])),
-    }
+# Some tasks rely on model-graded scoring; ensure OPENAI_API_KEY is present or override with flags.
+GRADER_HEAVY = {TASK_SIMPLEQA, TASK_HLE_TEXT, TASK_MATH_500}
 
-# ---------------- lm-eval integration ----------------
+# Global cancel state (for graceful Ctrl+C)
+CANCEL_REQUESTED = False
+HARD_CANCEL = False
 
-def ensure_lm_eval():
-    try:
-        subprocess.run(["lm_eval", "--help"], capture_output=True, check=False, timeout=5)
-    except FileNotFoundError:
-        log.error("lm-evaluation-harness CLI 'lm_eval' not found. Install: pip install 'lm-eval[api]'")
-        sys.exit(1)
+def sigint_handler(signum, frame):
+    global CANCEL_REQUESTED, HARD_CANCEL
+    if not CANCEL_REQUESTED:
+        CANCEL_REQUESTED = True
+        print("\n[runner] Caught Ctrl+C — will stop after current benchmark completes (press Ctrl+C again to hard-abort).", flush=True)
+    else:
+        HARD_CANCEL = True
+        print("\n[runner] Second Ctrl+C — hard-aborting now.", flush=True)
 
-def run_one(cfg: Dict[str,Any], bench: str, out_root: Path, limit: Optional[int]) -> Dict[str,Any]:
-    info = BENCHMARKS[bench]
-    task = info["task"]; few = info["fewshot"]
+def run_one_bench(
+    bench_name: str,
+    model: str,
+    base_url: Optional[str],
+    out_dir: Path,
+    batch: int,
+    temperature: float,
+    top_p: float,
+    max_tokens: Optional[int],
+    seed: Optional[int],
+    limit: Optional[str],
+    extra_model_args: List[str],
+    per_task_overrides: Dict[str, List[str]],
+    timeout_s: int,
+) -> Dict[str, Any]:
+    """Invoke `bench eval` for a single benchmark, capture JSON, write files."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    task_out_json = out_dir / f"{bench_name}.json"
+    task_stdout_log = out_dir / f"{bench_name}.stdout.log"
+    task_stderr_log = out_dir / f"{bench_name}.stderr.log"
 
-    outdir = out_root / f"{int(time.time())}-{bench}"
-    outdir.mkdir(parents=True, exist_ok=True)
+    # Build base command
+    cmd = ["bench", "eval", bench_name,
+           "--model", model,
+           "--max-connections", str(batch),
+           "--temperature", str(temperature),
+           "--top-p", str(top_p),
+           "--timeout", str(timeout_s),
+           "--json",
+           "--logfile", str(task_out_json)]
 
-    # Env for OpenAI-compatible backend
-    model_name = "vllm"
+    if base_url:
+        cmd += ["--model-base-url", base_url]
 
-    # vLLM engine args (tweak to your box)
-    # pretrained MUST be a local HF id or folder with weights (yours is ./models/24b-kto)
-    model_args = (
-        f"pretrained={cfg['model'].endpoint_model_name},"  # e.g. ./models/24b-kto
-        "dtype=float16,"                                    # or bfloat16
-        "tensor_parallel_size=1,"                           # >1 if multi-GPU
-        "gpu_memory_utilization=0.9,"                       # pack batches
-        "max_model_len=32768"                               # adjust if needed
-    )
-    cmd = [
-        "lm_eval",
-        "--model", model_name,
-        "--model_args", model_args,
-        "--tasks", task,
-        "--num_fewshot", str(few),
-        "--batch_size", "auto",              # vllm supports auto batching
-        "--output_path", str(outdir),
-        "--log_samples",
-    ]
-    if limit:
+    if seed is not None:
+        cmd += ["--seed", str(seed)]
+
+    if max_tokens is not None:
+        cmd += ["--max-tokens", str(max_tokens)]
+
+    if limit is not None:
+        # supports number or "start,end"
         cmd += ["--limit", str(limit)]
 
-    log.info("lm-eval: %s", " ".join(shlex.quote(x) for x in cmd))
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode != 0:
-        log.error("lm-eval failed for %s", bench)
-        if p.stderr:
-            log.error("stderr: %s", p.stderr.strip())
-        raise RuntimeError(f"lm-eval failed ({bench})")
+    # Per-task knobs: e.g., sandbox=docker for HumanEval
+    if bench_name in SANDBOX_NEEDED:
+        cmd += ["--sandbox", "docker"]
 
-    results_json = next((outdir.glob("results_*.json"))).__str__()
-    with open(results_json, "r") as f:
-        data = json.load(f)
+    # Allow passing arbitrary -M model args (e.g., reasoning_effort=high)
+    for m in extra_model_args:
+        cmd += ["-M", m]
 
-    task_block = data["results"].get(task, {})
-    metric = info["metric"]
-    score = task_block.get(metric)
-    if score is None:
-        for k, v in task_block.items():
-            if isinstance(v, (int, float)):
-                score, metric = v, k
-                break
+    # Per-task overrides (rarely needed; example placeholder)
+    if bench_name in per_task_overrides:
+        cmd += per_task_overrides[bench_name]
 
-    n = data.get("n-shot", {}).get(task) or data.get("versions",{}).get(task,{}).get("num_samp")
-    return {
-        "benchmark": bench,
-        "task": task,
-        "metric": metric,
-        "score": score,
-        "num_fewshot": few,
-        "samples": n,
-        "output_dir": outdir.as_posix(),
-    }
-
-
-# ---------------- Runner ----------------
-
-def run_all(cfg: Dict[str,Any], benches: List[str], limit: Optional[int], out_root: Path) -> Dict[str,Any]:
-    ensure_lm_eval()
-    out_root.mkdir(parents=True, exist_ok=True)
-
-    results = []
-    for b in benches:
+    print(f"[runner] Launching: {' '.join(cmd)}")
+    with open(task_stdout_log, "w", encoding="utf-8") as out_f, open(task_stderr_log, "w", encoding="utf-8") as err_f:
         try:
-            results.append(run_one(cfg, b, out_root, limit))
-        except Exception as e:
-            results.append({"benchmark": b, "task": BENCHMARKS[b]["task"], "metric": BENCHMARKS[b]["metric"],
-                            "score": None, "error": str(e)})
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
 
+            stdout_chunks = []
+            stderr_chunks = []
+
+            # Stream output so logs are flushed (useful if we get interrupted)
+            while True:
+                if HARD_CANCEL:
+                    proc.kill()
+                    raise KeyboardInterrupt("Hard-abort requested")
+
+                # Non-blocking-ish reads
+                line = proc.stdout.readline() if proc.stdout else ""
+                if line:
+                    out_f.write(line)
+                    stdout_chunks.append(line)
+                err_line = proc.stderr.readline() if proc.stderr else ""
+                if err_line:
+                    err_f.write(err_line)
+                    stderr_chunks.append(err_line)
+
+                if proc.poll() is not None:
+                    # drain remaining
+                    rest_out = proc.stdout.read() if proc.stdout else ""
+                    rest_err = proc.stderr.read() if proc.stderr else ""
+                    if rest_out:
+                        out_f.write(rest_out)
+                        stdout_chunks.append(rest_out)
+                    if rest_err:
+                        err_f.write(rest_err)
+                        stderr_chunks.append(rest_err)
+                    break
+
+                # If user requested cancel, we don't kill immediately; we wait for the eval to flush
+                if CANCEL_REQUESTED:
+                    # No-op: just refrain from starting the next benchmark
+                    pass
+
+                time.sleep(0.05)
+
+            rc = proc.returncode
+            if rc != 0:
+                raise RuntimeError(f"`bench eval {bench_name}` exited with {rc}. See logs: {task_stderr_log}")
+
+            # Parse JSON results: prefer the file we asked for via --logfile
+            if task_out_json.exists():
+                with open(task_out_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                # Fallback: try capturing from stdout
+                whole = "".join(stdout_chunks).strip()
+                try:
+                    data = json.loads(whole)
+                except Exception:
+                    raise RuntimeError(f"Could not parse JSON for {bench_name}. See {task_stdout_log}")
+
+            return data
+
+        except KeyboardInterrupt:
+            # Try to terminate gracefully
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            raise
+
+def choose_primary_metric(metrics: Dict[str, Any]) -> Optional[str]:
+    """Pick a sensible primary metric key from a metrics dict."""
+    if not metrics or not isinstance(metrics, dict):
+        return None
+    # Common keys in OB/Inspect tasks
+    preferred = ["acc", "accuracy", "pass@1", "pass1", "score", "auc", "exact_match"]
+    for k in preferred:
+        if k in metrics and isinstance(metrics[k], (int, float)):
+            return k
+    # Fallback: first numeric
+    for k, v in metrics.items():
+        if isinstance(v, (int, float)):
+            return k
+    return None
+
+def summarize_for_table(bench_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract a minimal summary row for markdown."""
+    metrics = result.get("metrics", {})
+    primary = choose_primary_metric(metrics)
     return {
-        "model": cfg["model"].name,
-        "endpoint_model_name": cfg["model"].endpoint_model_name,
-        "timestamp": int(time.time()),
-        "results": results,
+        "benchmark": bench_name,
+        "primary_metric": primary or "",
+        "value": (metrics.get(primary) if primary else None),
+        "n": result.get("samples", {}).get("count") or result.get("num_samples") or None,
     }
 
-def save_summary(cfg: Dict[str,Any], summary: Dict[str,Any], out_root: Path) -> Path:
-    out_root.mkdir(parents=True, exist_ok=True)
-    model_safe = cfg["model"].name.replace("/", "_")
-    out_file = out_root / f"{summary['timestamp']}-{model_safe}-diverse.json"
-    with open(out_file, "w") as f: json.dump(summary, f, indent=2)
-    log.info("Saved summary: %s", out_file)
-    return out_file
-
-# ---------------- CLI ----------------
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Run diverse benchmarks via lm-eval")
-    p.add_argument("--config", required=True)
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--benchmarks", nargs="+")
-    g.add_argument("--set", choices=BENCHMARK_SETS.keys())
-    p.add_argument("--limit", type=int)
-    p.add_argument("--output-dir", default="results_diverse")
-    p.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
-    return p.parse_args()
+def write_markdown_table(rows: List[Dict[str, Any]], path: Path):
+    # basic GitHub Markdown table
+    lines = []
+    lines.append("| Benchmark | Metric | Value | N |")
+    lines.append("|---|---:|---:|---:|")
+    for r in rows:
+        v = r["value"]
+        vstr = f"{v:.4f}" if isinstance(v, float) else (str(v) if v is not None else "")
+        nstr = str(r["n"]) if r["n"] is not None else ""
+        lines.append(f"| `{r['benchmark']}` | {r['primary_metric']} | {vstr} | {nstr} |")
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 def main():
-    args = parse_args()
-    logging.getLogger().setLevel(getattr(logging, args.log_level))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True, help="Inspect/OpenBench model string, e.g. vllm/meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument("--base-url", default=os.environ.get("BENCH_MODEL_BASE_URL"),
+                        help="Base URL for model API (vLLM OpenAI server), e.g. http://localhost:8000/v1")
+    parser.add_argument("--out-dir", default="runs/default", help="Output directory for artifacts")
+    parser.add_argument("--batch", type=int, default=32, help="Concurrent API calls (drives vLLM batching via Inspect/OpenBench)")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--limit", default=None, help="Limit samples: integer or 'start,end'")
+    parser.add_argument("--timeout", type=int, default=10000, help="Per-request timeout (seconds)")
+    parser.add_argument("--extra-model-arg", "-M", action="append", default=[], help="Pass-through extra model args (repeatable)")
+    parser.add_argument("--only", default=None, help="Comma-separated subset of tasks to run")
+    parser.add_argument("--skip", default=None, help="Comma-separated tasks to skip")
+    parser.add_argument("--resume", action="store_true", help="Skip tasks with an existing JSON result")
+    args = parser.parse_args()
 
-    benches = BENCHMARK_SETS[args.set] if args.set else args.benchmarks
-    invalid = [b for b in benches if b not in BENCHMARKS]
-    if invalid:
-        log.error("Invalid benchmarks: %s", invalid); return 1
+    # Install signal handlers
+    signal.signal(signal.SIGINT, sigint_handler)
 
-    cfg = load_cfg(args.config)
-    out_root = Path(args.output_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Diverse Eval Runner")
-    print("="*60)
-    print(f"Benchmarks: {', '.join(benches)}")
-    if args.limit: print(f"Limit per task: {args.limit}")
-    print("="*60)
+    # Determine task list
+    tasks = DEFAULT_TASKS[:]
+    if args.only:
+        keep = {t.strip() for t in args.only.split(",") if t.strip()}
+        tasks = [t for t in tasks if t in keep]
+    if args.skip:
+        drop = {t.strip() for t in args.skip.split(",") if t.strip()}
+        tasks = [t for t in tasks if t not in drop]
 
-    summary = run_all(cfg, benches, args.limit, out_root)
-    out_file = save_summary(cfg, summary, out_root)
+    # Optional per-task overrides placeholder (e.g., custom grader or task flags)
+    per_task_overrides: Dict[str, List[str]] = {}
 
-    # concise console summary
-    scores = []
-    for r in summary["results"]:
-        s = r.get("score")
-        if s is None:
-            print(f"{r['benchmark']:20s}: FAILED ({r.get('error','')})")
-        else:
-            scores.append(s)
-            print(f"{r['benchmark']:20s}: {s*100:6.2f}%  [{r['metric']}]")
-    if scores:
-        avg = sum(scores)/len(scores)
-        print("-"*60)
-        print(f"{'Average':20s}: {avg*100:6.2f}%")
-    print(f"\nSummary saved: {out_file}")
-    return 0
+    consolidated: Dict[str, Any] = {
+        "model": args.model,
+        "base_url": args.base_url,
+        "batch": args.batch,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "max_tokens": args.max_tokens,
+        "seed": args.seed,
+        "limit": args.limit,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "results": {}
+    }
+
+    table_rows = []
+
+    try:
+        for bench in tasks:
+            if CANCEL_REQUESTED:
+                print("[runner] Cancellation requested: skipping remaining tasks.")
+                break
+
+            task_file = out_dir / f"{bench}.json"
+            if args.resume and task_file.exists():
+                print(f"[runner] Skipping {bench} (resume: found {task_file})")
+                with open(task_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                consolidated["results"][bench] = data
+                table_rows.append(summarize_for_table(bench, data))
+                continue
+
+            if bench in GRADER_HEAVY and not os.environ.get("OPENAI_API_KEY"):
+                print(f"[warn] {bench} typically uses an OpenAI grader by default — OPENAI_API_KEY not set. "
+                      f"Consider exporting it or overriding the grader; continuing anyway.")
+
+            data = run_one_bench(
+                bench_name=bench,
+                model=args.model,
+                base_url=args.base_url,
+                out_dir=out_dir,
+                batch=args.batch,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                max_tokens=args.max_tokens,
+                seed=args.seed,
+                limit=args.limit,
+                extra_model_args=args.extra_model_arg,
+                per_task_overrides=per_task_overrides,
+                timeout_s=args.timeout,
+            )
+            consolidated["results"][bench] = data
+            table_rows.append(summarize_for_table(bench, data))
+
+    except KeyboardInterrupt:
+        print("[runner] Interrupted by user.")
+    finally:
+        # Write consolidated artifacts
+        consolidated_path = out_dir / "consolidated.json"
+        with open(consolidated_path, "w", encoding="utf-8") as f:
+            json.dump(consolidated, f, ensure_ascii=False, indent=2)
+
+        md_path = out_dir / "results.md"
+        write_markdown_table(table_rows, md_path)
+
+        print(f"\n[runner] Wrote consolidated JSON: {consolidated_path}")
+        print(f"[runner] Wrote Markdown table:     {md_path}\n")
+
+        if CANCEL_REQUESTED:
+            print("[runner] Note: run was cancelled mid-stream; some tasks may be missing or partial.")
+        sys.exit(0)
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
