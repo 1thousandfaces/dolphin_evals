@@ -806,7 +806,7 @@ class Runner:
         progress = tqdm(total=len(all_tasks),
                   desc="Model batches",
                   unit="turn")
-        for batch_start in range(0, len(all_tasks), batch_size):
+        for i in range(0, len(all_tasks), batch_size):
         #for i in tqdm(range(0, len(all_tasks), batch_size), desc="Model batches"):
             batch = all_tasks[i:i + batch_size]
             batch_results = self._execute_model_batch(batch)
