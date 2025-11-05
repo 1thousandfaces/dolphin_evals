@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-runner_multiturn_classifier.py
+runner_multiturn.py
 Multi-turn refusals runner using simple classifier instead of judge model.
 
 - Evaluates ONLY on USER (human) turns.
@@ -376,6 +374,7 @@ def _norm(u: str) -> str:
     return (u or "").rstrip("/")
 
 def chat_url(base: str) -> str:
+    #return _norm(base) + "/chat/completions"
     return _norm(base) + "/v1/chat/completions"
 
 def auth_header(token: str) -> Dict[str, str]:
@@ -471,6 +470,28 @@ def format_messages_readable(messages: List[Dict[str, str]]) -> str:
     return "\n\n".join(lines)
 
 def load_items(args) -> List[Dict[str, Any]]:
+    if args.source == "url":
+        log.info(f"Loading dataset from URL: {args.url}")
+        ds = load_dataset("json", data_files={"train": args.url}, split=args.hf_split)
+        log.info(f"Dataset loaded: {len(ds)} rows")
+        
+        ids_set = set([s.strip() for s in (args.ids.split(",") if args.ids else []) if s.strip()])
+        
+        items: List[Dict[str, Any]] = []
+        for i, row in enumerate(ds):
+            item_id = row.get("id") or row.get("conversation_id") or f"row_{i}"
+            if ids_set and item_id not in ids_set:
+                continue
+            convo = row.get("conversation") or row.get("conversations") or row.get("turns")
+            if isinstance(convo, list):
+                items.append({"type": "multi", "id": item_id, "category": row.get("category", "unknown"), "conversation": convo})
+            elif "prompt" in row:
+                items.append({"type": "single", "id": item_id, "category": row.get("category", "unknown"), "prompt": row["prompt"]})
+
+            if args.max_convs and len(items) >= args.max_convs:
+                break
+        return items
+        
     if args.source == "local":
         log.info(f"Loading local dataset from {args.local_file} ...")
         raw_data = []
@@ -781,12 +802,21 @@ class Runner:
         log.info("Executing model inference in batches...")
         model_results = {}
         batch_size = self.backend.batch_size
-        
-        for i in tqdm(range(0, len(all_tasks), batch_size), desc="Model batches"):
+
+        progress = tqdm(total=len(all_tasks),
+                  desc="Model batches",
+                  unit="turn")
+        for batch_start in range(0, len(all_tasks), batch_size):
+        #for i in tqdm(range(0, len(all_tasks), batch_size), desc="Model batches"):
             batch = all_tasks[i:i + batch_size]
             batch_results = self._execute_model_batch(batch)
             for task_idx, reply in batch_results:
                 model_results[task_idx] = reply
+            progress.update(len(batch_results))
+            progress.set_postfix(conv=batch[-1].item_id)
+
+        progress.close()
+
         
         
         # Phase 3: Execute classifier scoring in batches
@@ -798,12 +828,19 @@ class Runner:
         
         classifier_results = {}
         batch_size_classifier = self.classifier_cfg.batch_size
-        
-        for i in tqdm(range(0, len(classify_tasks), batch_size_classifier), desc="Classifier batches"):
+
+        progress = tqdm(total=len(all_tasks),
+                  desc="Classifier batches",
+                  unit="turn")
+        for batch_start in range(0, len(classify_tasks), batch_size_classifier):        
+        #for i in tqdm(range(0, len(classify_tasks), batch_size_classifier), desc="Classifier batches"):
             batch = classify_tasks[i:i + batch_size_classifier]
             batch_results = self._execute_classifier_batch(batch)
             for task_idx, predicted_class, confidence, class_name in batch_results:
                 classifier_results[task_idx] = (predicted_class, confidence, class_name)
+            progress.update(len(classifier_results))
+            progress.set_postfix(conv=batch[-1].item_id)
+        progress.close()
         
         # Phase 4: Assemble results
         log.info("Assembling results...")
@@ -1007,12 +1044,16 @@ class Runner:
 def parse_args():
     p = argparse.ArgumentParser(description="Multi-turn refusals runner with classifier")
     p.add_argument("--config", required=True)
-    p.add_argument("--source", choices=["hf", "local"], required=True)
+    p.add_argument("--source", choices=["hf", "local", "url"], required=True)
     
     # HF args
     p.add_argument("--hf-dataset", help="HF dataset path, optionally with :config (e.g., name:default)")
     p.add_argument("--hf-config", help="HF dataset config name (if not given via --hf-dataset)")
     p.add_argument("--hf-split", default="train")
+
+    #HF specific dataset url args
+    p.add_argument("--url", help="Direct URL to JSONL file")
+
     
     # Local args
     p.add_argument("--local-file", help="Path to local JSON file")
