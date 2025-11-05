@@ -2,81 +2,78 @@
 # -*- coding: utf-8 -*-
 
 """
-OpenBench + vLLM eval runner with:
-- batching via --max-connections (drives vLLM's dynamic batching)
-- graceful Ctrl+C (first SIGINT: finish current eval if possible; second: hard stop)
-- per-task JSON artifacts + consolidated JSON + markdown table
+Fast, resilient OpenBench runner.
 
-Usage (examples):
-  python eval_runner.py \
-    --model vllm/meta-llama/Llama-3.1-8B-Instruct \
-    --base-url http://localhost:8000/v1 \
-    --out-dir runs/llama31-8b \
-    --batch 64 \
-    --temperature 0.0 \
-    --seed 0
+- Auto-resolves benchmark names across builds (underscore/hyphen, mrcr variants).
+- Optional parallel execution across benchmarks (--parallel).
+- "Fast" mode with conservative per-task --max-tokens caps (--fast).
+- Resolves openai/* served model id once, optional 1-token warmup (--warmup).
+- Graceful Ctrl+C (soft cancel, then hard abort).
+- Writes consolidated JSON + markdown table.
 
-You can subset tasks with --only or --skip (comma-separated names).
+Usage examples:
+
+  # quick smoke
+  python runner_diverse.py \
+    --model openai/24b-kto \
+    --base-url http://localhost:8001/v1 \
+    --only mmlu,gpqa_diamond,openai_mrcr \
+    --limit 50 --fast --parallel 2 --batch 64 --warmup --resume
+
+  # skip graders if you lack API keys
+  python runner_diverse.py --skip hle_text,simpleqa,math_500 ...
 """
 
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
-# ---- Canonical OpenBench benchmark names (per docs) ----
-# Knowledge
-TASK_MMLU           = "mmlu"          # MMLU
-TASK_MMLU_PRO       = "mmlu_pro"      # MMLU-Pro
-TASK_GPQA_DIAMOND   = "gpqa_diamond"  # GPQA (graduate-level)
-
-# HLE text-only (no vision)
-TASK_HLE_TEXT       = "hle_text"      # HLE_text
-
-# Coding
-TASK_HUMANEVAL      = "humaneval"     # 164 problems
-TASK_JSONSCHEMABENCH= "jsonschemabench"
-
-# Math
-TASK_AIME_2023_I    = "aime_2023_I"
-TASK_AIME_2023_II   = "aime_2023_II"
-TASK_AIME_2024      = "aime_2024"     # Some builds also have I/II variants
-TASK_AIME_2024_I    = "aime_2024_I"
-TASK_AIME_2024_II   = "aime_2024_II"
-TASK_AIME_2025      = "aime_2025"
-TASK_AIME_2025_II   = "aime_2025_II"
-TASK_MATH_500       = "math_500"
-
-# Reasoning / factuality
-TASK_SIMPLEQA       = "simpleqa"
-
-# Long-context retrieval
-TASK_MRCR           = "mrcr"          # OpenAI MRCR (multi-needle)
-
-DEFAULT_TASKS = [
-    TASK_MMLU, TASK_MMLU_PRO, TASK_GPQA_DIAMOND,
-    TASK_HLE_TEXT,
-    TASK_HUMANEVAL, TASK_JSONSCHEMABENCH,
-    TASK_AIME_2023_I, TASK_AIME_2023_II,
-    TASK_AIME_2024, TASK_AIME_2024_I, TASK_AIME_2024_II,
-    TASK_AIME_2025, TASK_AIME_2025_II,
-    TASK_MATH_500,
-    TASK_SIMPLEQA,
-    TASK_MRCR,
+# ---------------- Tasks you asked for ----------------
+TASKS = [
+    "mmlu", "mmlu_pro", "gpqa_diamond",
+    "hle_text",
+    "humaneval", "jsonschemabench",
+    "aime_2023_I", "aime_2023_II",
+    "aime_2024", "aime_2024_I", "aime_2024_II",
+    "aime_2025", "aime_2025_II",
+    "math_500",
+    "simpleqa",
+    "mrcr",
 ]
 
-# Which tasks need a code sandbox (docker) for test execution?
-SANDBOX_NEEDED = {TASK_HUMANEVAL}
+# Some builds need a sandbox for humaneval; allow disabling via env.
+# Set RUNNER_DISABLE_SANDBOX=1 to skip forcing docker.
+_NEEDS_SANDBOX_BASE = {"humaneval"}
+NEEDS_SANDBOX = set() if os.environ.get("RUNNER_DISABLE_SANDBOX") else _NEEDS_SANDBOX_BASE
 
-# Some tasks rely on model-graded scoring; ensure OPENAI_API_KEY is present or override with flags.
-GRADER_HEAVY = {TASK_SIMPLEQA, TASK_HLE_TEXT, TASK_MATH_500}
+# These tasks do extra model-graded work; they can be slow.
+GRADER_HEAVY  = {"hle_text", "simpleqa", "math_500"}
 
-# Global cancel state (for graceful Ctrl+C)
+# Conservative per-task max-token caps for "fast" mode
+FAST_MAX_TOKENS: Dict[str, int] = {
+    "mmlu": 4, "mmlu_pro": 8, "mmlu-pro": 8, "gpqa_diamond": 8,
+    "aime_2023_I": 64, "aime_2023_II": 64,
+    "aime_2024": 64, "aime_2024_I": 64, "aime_2024_II": 64,
+    "aime_2025": 64, "aime_2025_II": 64,
+    "math_500": 128,
+    "simpleqa": 32,
+    "mrcr": 64, "openai_mrcr": 64, "openai_mrcr_2n": 64, "openai_mrcr_4n": 64, "openai_mrcr_8n": 64,
+    "jsonschemabench": 128,
+    "hle_text": 64,
+    "humaneval": 512,
+}
+
+# --------------- Ctrl+C handling ----------------
 CANCEL_REQUESTED = False
 HARD_CANCEL = False
 
@@ -84,12 +81,227 @@ def sigint_handler(signum, frame):
     global CANCEL_REQUESTED, HARD_CANCEL
     if not CANCEL_REQUESTED:
         CANCEL_REQUESTED = True
-        print("\n[runner] Caught Ctrl+C — will stop after current benchmark completes (press Ctrl+C again to hard-abort).", flush=True)
+        print("\n[runner] Ctrl+C — will stop after this benchmark (press again to hard-abort).", flush=True)
     else:
         HARD_CANCEL = True
         print("\n[runner] Second Ctrl+C — hard-aborting now.", flush=True)
 
-def run_one_bench(
+# --------------- Utilities ----------------
+def sh(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
+
+def bench_supported_flags(bench_cmd: str) -> Set[str]:
+    """
+    Parse `bench eval --help` and return supported long/short flags.
+    Different OpenBench builds expose different knobs; we auto-detect.
+    """
+    try:
+        out = sh([bench_cmd, "eval", "--help"], check=True).stdout
+    except Exception:
+        out = sh([bench_cmd, "--help"], check=True).stdout
+
+    flags: Set[str] = set()
+    for line in out.splitlines():
+        for m in re.finditer(r"(--[a-zA-Z0-9\-]+)", line):
+            flags.add(m.group(1))
+        if re.search(r"(^|\s)-M(\s|,|$)", line):
+            flags.add("-M")
+    return flags
+
+def bench_available_tasks(bench_cmd: str) -> Set[str]:
+    """Get available benchmark ids from `bench list`."""
+    try:
+        out = sh([bench_cmd, "list"], check=True).stdout.strip()
+    except Exception:
+        return set()
+    # often a single line, comma/space separated
+    tokens = re.split(r"[\s,]+", out)
+    return {t for t in (tok.strip() for tok in tokens) if t}
+
+def resolve_bench_name(requested: str, available: Set[str]) -> str:
+    """Map friendly names to build-specific ids."""
+    if requested in available:
+        return requested
+    # underscore ↔ hyphen
+    a = requested.replace("_", "-")
+    if a in available:
+        return a
+    b = requested.replace("-", "_")
+    if b in available:
+        return b
+    # mrcr family fallback
+    if requested.lower() == "mrcr":
+        for cand in ["openai_mrcr", "openai_mrcr_2n", "openai_mrcr_4n", "openai_mrcr_8n"]:
+            if cand in available:
+                return cand
+    # loose contains (last resort)
+    norm_req = re.sub(r"[_\-]", "", requested.lower())
+    for cand in available:
+        if norm_req and norm_req in re.sub(r"[_\-]", "", cand.lower()):
+            return cand
+    return requested  # let it fail loudly
+
+def preflight(bench_cmd: str, base_url: Optional[str]) -> None:
+    # CLI present?
+    try:
+        sh([bench_cmd, "list"], check=False)
+    except FileNotFoundError:
+        raise RuntimeError("`bench` not found. Install/activate OpenBench first.")
+    # vLLM OpenAI endpoint reachable?
+    if base_url:
+        url = base_url.rstrip("/") + "/models"
+        try:
+            with urllib.request.urlopen(url, timeout=3) as r:
+                if r.status >= 400:
+                    raise RuntimeError(f"Model base URL returned HTTP {r.status}: {url}")
+        except Exception as e:
+            raise RuntimeError(f"Cannot reach {url}: {e}")
+
+def resolve_openai_model_id(base_url: str, user_suffix: Optional[str]) -> str:
+    """
+    Resolve actual model id advertised by vLLM (/v1/models).
+    If one model is served, use that. If multiple, prefer exact match on user_suffix.
+    """
+    url = base_url.rstrip("/") + "/models"
+    with urllib.request.urlopen(url, timeout=3) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    ids = [m["id"] for m in data.get("data", [])]
+    if not ids:
+        raise RuntimeError(f"No models advertised by {url}")
+    if user_suffix and user_suffix in ids:
+        return user_suffix
+    if len(ids) == 1:
+        return ids[0]
+    if user_suffix:
+        for mid in ids:
+            if user_suffix in mid:
+                return mid
+    return ids[0]
+
+def warmup_model(base_url: str, model_id: str, api_key: Optional[str]) -> None:
+    """Send a tiny chat completion to warm up the server & GPU kernels."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": "ok"}],
+        "max_tokens": 1,
+        "temperature": 0.0,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            if r.status >= 400:
+                raise RuntimeError(f"warmup HTTP {r.status}")
+    except Exception as e:
+        print(f"[warn] Warmup failed (ignored): {e}", flush=True)
+
+def choose_primary_metric(metrics: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(metrics, dict):
+        return None
+    preferred = ["acc", "accuracy", "pass@1", "pass1", "score", "auc", "exact_match", "compliance_rate"]
+    for k in preferred:
+        if k in metrics and isinstance(metrics[k], (int, float)):
+            return k
+    for k, v in metrics.items():
+        if isinstance(v, (int, float)):
+            return k
+    return None
+
+def summarize_row(bench: str, res: Dict[str, Any]) -> Dict[str, Any]:
+    m = res.get("metrics", {}) if isinstance(res, dict) else {}
+    primary = choose_primary_metric(m)
+    n = None
+    if isinstance(res, dict):
+        n = res.get("num_samples") or (res.get("samples") or {}).get("count") or res.get("n")
+    return {"benchmark": bench, "metric": primary or "", "value": m.get(primary), "n": n}
+
+def write_md(rows: List[Dict[str, Any]], path: Path) -> None:
+    lines = ["| Benchmark | Metric | Value | N |", "|---|---:|---:|---:|"]
+    for r in rows:
+        v = r["value"]
+        vstr = f"{v:.4f}" if isinstance(v, float) else (str(v) if v is not None else "")
+        nstr = str(r["n"]) if r["n"] is not None else ""
+        lines.append(f"| `{r['benchmark']}` | {r['metric']} | {vstr} | {nstr} |")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+def normalize_eval_result(data: Any) -> Dict[str, Any]:
+    """Extract a final aggregate with 'metrics' from various OpenBench outputs."""
+    if isinstance(data, dict) and "metrics" in data:
+        return data
+    if isinstance(data, list):
+        for item in reversed(data):
+            if isinstance(item, dict) and "metrics" in item:
+                return item
+        for item in reversed(data):
+            if isinstance(item, dict):
+                return item
+    return {"metrics": {}, "raw": data}
+
+# --------------- Core executor ----------------
+def build_cmd_for_task(
+    supported: Set[str],
+    bench_cmd: str,
+    bench_name: str,
+    model: str,
+    base_url: Optional[str],
+    batch: int,
+    temperature: float,
+    top_p: float,
+    max_tokens: Optional[int],
+    seed: Optional[int],
+    limit: Optional[str],
+    extra_model_args: List[str],
+    timeout_s: int,
+    log_filename_no_ext: str,  # e.g. "mmlu.eval" -> tool will add .json
+) -> Tuple[List[str], Path]:
+    cmd = [bench_cmd, "eval", bench_name, "--model", model]
+
+    if "--temperature" in supported:
+        cmd += ["--temperature", str(temperature)]
+    if "--top-p" in supported:
+        cmd += ["--top-p", str(top_p)]
+    if "--timeout" in supported:
+        cmd += ["--timeout", str(timeout_s)]
+    if "--max-connections" in supported:
+        cmd += ["--max-connections", str(batch)]
+    if max_tokens is not None and "--max-tokens" in supported:
+        cmd += ["--max-tokens", str(max_tokens)]
+
+    # logging
+    json_target = Path(f"{log_filename_no_ext}.json")
+    if "--log-format" in supported:
+        cmd += ["--log-format", "json"]
+    if "--logfile" in supported:
+        cmd += ["--logfile", str(log_filename_no_ext)]
+    if "--display" in supported:
+        cmd += ["--display", "none"]
+
+    # base url
+    if base_url and "--model-base-url" in supported:
+        cmd += ["--model-base-url", base_url]
+
+    # misc
+    if seed is not None and "--seed" in supported:
+        cmd += ["--seed", str(seed)]
+    if limit is not None and "--limit" in supported:
+        cmd += ["--limit", str(limit)]
+    if bench_name in NEEDS_SANDBOX and "--sandbox" in supported:
+        cmd += ["--sandbox", "docker"]
+
+    # extra model args
+    if "-M" in supported:
+        for m in extra_model_args:
+            cmd += ["-M", m]
+
+    return cmd, json_target
+
+def run_bench(
+    supported: Set[str],
+    bench_cmd: str,
     bench_name: str,
     model: str,
     base_url: Optional[str],
@@ -101,190 +313,152 @@ def run_one_bench(
     seed: Optional[int],
     limit: Optional[str],
     extra_model_args: List[str],
-    per_task_overrides: Dict[str, List[str]],
     timeout_s: int,
+    openai_api_key: Optional[str],
 ) -> Dict[str, Any]:
-    """Invoke `bench eval` for a single benchmark, capture JSON, write files."""
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    task_out_json = out_dir / f"{bench_name}.json"
-    task_stdout_log = out_dir / f"{bench_name}.stdout.log"
-    task_stderr_log = out_dir / f"{bench_name}.stderr.log"
+    stdout_log = out_dir / f"{bench_name}.stdout.log"
+    stderr_log = out_dir / f"{bench_name}.stderr.log"
 
-    # Build base command
-    cmd = ["bench", "eval", bench_name,
-           "--model", model,
-           "--max-connections", str(batch),
-           "--temperature", str(temperature),
-           "--top-p", str(top_p),
-           "--timeout", str(timeout_s),
-           "--json",
-           "--logfile", str(task_out_json)]
+    log_stem = bench_name + ".eval"  # let OpenBench append .json
+    cmd, expected_json_rel = build_cmd_for_task(
+        supported=supported,
+        bench_cmd=bench_cmd,
+        bench_name=bench_name,
+        model=model,
+        base_url=base_url,
+        batch=batch,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        seed=seed,
+        limit=limit,
+        extra_model_args=extra_model_args,
+        timeout_s=timeout_s,
+        log_filename_no_ext=log_stem,
+    )
 
-    if base_url:
-        cmd += ["--model-base-url", base_url]
+    print(f"[runner] Launching: {' '.join(cmd)}", flush=True)
 
-    if seed is not None:
-        cmd += ["--seed", str(seed)]
+    # Environment: force logs into out_dir and set OPENAI_API_KEY if using OpenAI provider
+    env = os.environ.copy()
+    env.setdefault("INSPECT_LOG_DIR", str(out_dir.resolve()))
+    if model.startswith("openai/"):
+        env.setdefault("OPENAI_API_KEY", openai_api_key or "dummy")
 
-    if max_tokens is not None:
-        cmd += ["--max-tokens", str(max_tokens)]
-
-    if limit is not None:
-        # supports number or "start,end"
-        cmd += ["--limit", str(limit)]
-
-    # Per-task knobs: e.g., sandbox=docker for HumanEval
-    if bench_name in SANDBOX_NEEDED:
-        cmd += ["--sandbox", "docker"]
-
-    # Allow passing arbitrary -M model args (e.g., reasoning_effort=high)
-    for m in extra_model_args:
-        cmd += ["-M", m]
-
-    # Per-task overrides (rarely needed; example placeholder)
-    if bench_name in per_task_overrides:
-        cmd += per_task_overrides[bench_name]
-
-    print(f"[runner] Launching: {' '.join(cmd)}")
-    with open(task_stdout_log, "w", encoding="utf-8") as out_f, open(task_stderr_log, "w", encoding="utf-8") as err_f:
+    with open(stdout_log, "w", encoding="utf-8") as so, open(stderr_log, "w", encoding="utf-8") as se:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env=env)
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-
-            stdout_chunks = []
-            stderr_chunks = []
-
-            # Stream output so logs are flushed (useful if we get interrupted)
             while True:
                 if HARD_CANCEL:
                     proc.kill()
-                    raise KeyboardInterrupt("Hard-abort requested")
+                    raise KeyboardInterrupt("Hard abort")
 
-                # Non-blocking-ish reads
-                line = proc.stdout.readline() if proc.stdout else ""
-                if line:
-                    out_f.write(line)
-                    stdout_chunks.append(line)
-                err_line = proc.stderr.readline() if proc.stderr else ""
-                if err_line:
-                    err_f.write(err_line)
-                    stderr_chunks.append(err_line)
+                o = proc.stdout.readline() if proc.stdout else ""
+                e = proc.stderr.readline() if proc.stderr else ""
+                if o: so.write(o)
+                if e: se.write(e)
 
                 if proc.poll() is not None:
-                    # drain remaining
-                    rest_out = proc.stdout.read() if proc.stdout else ""
-                    rest_err = proc.stderr.read() if proc.stderr else ""
-                    if rest_out:
-                        out_f.write(rest_out)
-                        stdout_chunks.append(rest_out)
-                    if rest_err:
-                        err_f.write(rest_err)
-                        stderr_chunks.append(rest_err)
+                    # drain
+                    if proc.stdout:
+                        rest = proc.stdout.read() or ""
+                        if rest: so.write(rest)
+                    if proc.stderr:
+                        rest = proc.stderr.read() or ""
+                        if rest: se.write(rest)
                     break
-
-                # If user requested cancel, we don't kill immediately; we wait for the eval to flush
-                if CANCEL_REQUESTED:
-                    # No-op: just refrain from starting the next benchmark
-                    pass
-
                 time.sleep(0.05)
 
-            rc = proc.returncode
-            if rc != 0:
-                raise RuntimeError(f"`bench eval {bench_name}` exited with {rc}. See logs: {task_stderr_log}")
-
-            # Parse JSON results: prefer the file we asked for via --logfile
-            if task_out_json.exists():
-                with open(task_out_json, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            else:
-                # Fallback: try capturing from stdout
-                whole = "".join(stdout_chunks).strip()
+            if proc.returncode != 0:
+                tail = ""
                 try:
-                    data = json.loads(whole)
+                    tail = "\n".join(stderr_log.read_text(encoding="utf-8").splitlines()[-80:])
                 except Exception:
-                    raise RuntimeError(f"Could not parse JSON for {bench_name}. See {task_stdout_log}")
+                    pass
+                raise RuntimeError(f"`bench eval {bench_name}` exited {proc.returncode}. Stderr tail:\n{tail}")
 
+            # Because we set INSPECT_LOG_DIR and gave a simple stem, the tool should create:
+            # <out_dir>/<bench_name>.eval.json
+            expected_json = (out_dir / expected_json_rel).resolve()
+            if not expected_json.exists():
+                candidates = sorted(out_dir.glob(f"{bench_name}.eval*.json"),
+                                    key=lambda p: p.stat().st_mtime, reverse=True)
+                if not candidates:
+                    raise RuntimeError(f"No JSON logfile found for {bench_name} in {out_dir}.")
+                expected_json = candidates[0]
+
+            data = json.loads(expected_json.read_text(encoding="utf-8"))
+            data = normalize_eval_result(data)
             return data
 
-        except KeyboardInterrupt:
-            # Try to terminate gracefully
+        finally:
             try:
                 proc.terminate()
             except Exception:
                 pass
-            raise
 
-def choose_primary_metric(metrics: Dict[str, Any]) -> Optional[str]:
-    """Pick a sensible primary metric key from a metrics dict."""
-    if not metrics or not isinstance(metrics, dict):
-        return None
-    # Common keys in OB/Inspect tasks
-    preferred = ["acc", "accuracy", "pass@1", "pass1", "score", "auc", "exact_match"]
-    for k in preferred:
-        if k in metrics and isinstance(metrics[k], (int, float)):
-            return k
-    # Fallback: first numeric
-    for k, v in metrics.items():
-        if isinstance(v, (int, float)):
-            return k
-    return None
-
-def summarize_for_table(bench_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract a minimal summary row for markdown."""
-    metrics = result.get("metrics", {})
-    primary = choose_primary_metric(metrics)
-    return {
-        "benchmark": bench_name,
-        "primary_metric": primary or "",
-        "value": (metrics.get(primary) if primary else None),
-        "n": result.get("samples", {}).get("count") or result.get("num_samples") or None,
-    }
-
-def write_markdown_table(rows: List[Dict[str, Any]], path: Path):
-    # basic GitHub Markdown table
-    lines = []
-    lines.append("| Benchmark | Metric | Value | N |")
-    lines.append("|---|---:|---:|---:|")
-    for r in rows:
-        v = r["value"]
-        vstr = f"{v:.4f}" if isinstance(v, float) else (str(v) if v is not None else "")
-        nstr = str(r["n"]) if r["n"] is not None else ""
-        lines.append(f"| `{r['benchmark']}` | {r['primary_metric']} | {vstr} | {nstr} |")
-    path.write_text("\n".join(lines), encoding="utf-8")
-
+# --------------- Main ----------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Inspect/OpenBench model string, e.g. vllm/meta-llama/Llama-3.1-8B-Instruct")
-    parser.add_argument("--base-url", default=os.environ.get("BENCH_MODEL_BASE_URL"),
-                        help="Base URL for model API (vLLM OpenAI server), e.g. http://localhost:8000/v1")
-    parser.add_argument("--out-dir", default="runs/default", help="Output directory for artifacts")
-    parser.add_argument("--batch", type=int, default=32, help="Concurrent API calls (drives vLLM batching via Inspect/OpenBench)")
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--max-tokens", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--limit", default=None, help="Limit samples: integer or 'start,end'")
-    parser.add_argument("--timeout", type=int, default=10000, help="Per-request timeout (seconds)")
-    parser.add_argument("--extra-model-arg", "-M", action="append", default=[], help="Pass-through extra model args (repeatable)")
-    parser.add_argument("--only", default=None, help="Comma-separated subset of tasks to run")
-    parser.add_argument("--skip", default=None, help="Comma-separated tasks to skip")
-    parser.add_argument("--resume", action="store_true", help="Skip tasks with an existing JSON result")
-    args = parser.parse_args()
-
-    # Install signal handlers
     signal.signal(signal.SIGINT, sigint_handler)
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", required=True, help="Provider/model (e.g., openai/24b-kto). Use openai/* with --base-url.")
+    p.add_argument("--base-url", default=os.environ.get("BENCH_MODEL_BASE_URL"),
+                   help="OpenAI-compatible base URL, e.g., http://localhost:8001/v1")
+    p.add_argument("--out-dir", default="runs/default")
+    p.add_argument("--batch", type=int, default=32)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--max-tokens", type=int, default=None)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--limit", default=None)
+    p.add_argument("--timeout", type=int, default=10000)
+    p.add_argument("--extra-model-arg", "-M", action="append", default=[])
+    p.add_argument("--only", default=None)
+    p.add_argument("--skip", default=None)
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--bench-cmd", default="bench")
+    p.add_argument("--openai-api-key", default=os.environ.get("OPENAI_API_KEY"))
+    p.add_argument("--parallel", type=int, default=int(os.environ.get("RUN_PARALLEL", "1")),
+                   help="Run up to N benchmarks concurrently (default: 1). Total inflight ≈ parallel*batch.")
+    p.add_argument("--fast", action="store_true",
+                   help="Use conservative per-task max-token caps (ignored if --max-tokens is set).")
+    p.add_argument("--warmup", action="store_true",
+                   help="Send a 1-token request to warm the model before the first benchmark.")
+    args = p.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Determine task list
-    tasks = DEFAULT_TASKS[:]
+    # Feature-detect flags and preflight connectivity
+    try:
+        supported = bench_supported_flags(args.bench_cmd)
+        preflight(args.bench_cmd, args.base_url)
+        if "--max-connections" not in supported:
+            print("[note] This OpenBench build lacks --max-connections; using default concurrency.", flush=True)
+    except Exception as e:
+        print(f"[fatal] Preflight failed: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    # Resolve openai/* model id ONCE, optionally warm up
+    if args.model.startswith("openai/") and args.base_url:
+        suffix = args.model.split("/", 1)[1] if "/" in args.model else None
+        try:
+            resolved = resolve_openai_model_id(args.base_url, suffix)
+            if resolved != suffix:
+                print(f"[runner] Resolved model id: {suffix!r} -> {resolved!r}")
+            args.model = f"openai/{resolved}"
+        except Exception as e:
+            print(f"[warn] Could not resolve model id from {args.base_url}/models: {e}. Using {args.model} as-is.")
+        if args.warmup:
+            try:
+                warmup_model(args.base_url, args.model.split("/", 1)[1], args.openai_api_key)
+            except Exception as e:
+                print(f"[warn] Warmup error (ignored): {e}")
+
+    # Task selection
+    tasks = TASKS[:]
     if args.only:
         keep = {t.strip() for t in args.only.split(",") if t.strip()}
         tasks = [t for t in tasks if t in keep]
@@ -292,78 +466,125 @@ def main():
         drop = {t.strip() for t in args.skip.split(",") if t.strip()}
         tasks = [t for t in tasks if t not in drop]
 
-    # Optional per-task overrides placeholder (e.g., custom grader or task flags)
-    per_task_overrides: Dict[str, List[str]] = {}
+    if any(t in GRADER_HEAVY for t in tasks) and not os.environ.get("OPENAI_API_KEY"):
+        print("[warn] Some tasks use an OpenAI grader by default: hle_text, simpleqa, math_500. "
+              "Set OPENAI_API_KEY for those to run, or skip them.", flush=True)
+
+    # Fetch available benchmark ids and pre-resolve
+    available = bench_available_tasks(args.bench_cmd)
+    resolved_tasks: List[str] = []
+    for name in tasks:
+        r = resolve_bench_name(name, available) if available else name
+        if r != name:
+            print(f"[runner] Using benchmark alias: {name!r} -> {r!r}")
+        resolved_tasks.append(r)
+    tasks = resolved_tasks
 
     consolidated: Dict[str, Any] = {
         "model": args.model,
         "base_url": args.base_url,
         "batch": args.batch,
+        "parallel": args.parallel,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "max_tokens": args.max_tokens,
         "seed": args.seed,
         "limit": args.limit,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "results": {}
+        "results": {},
+        "errors": {}
     }
+    rows: List[Dict[str, Any]] = []
+    exit_code = 0
+    lock = threading.Lock()
 
-    table_rows = []
+    # If we parallelize, scale per-bench connections so total inflight stays reasonable.
+    per_bench_batch = max(1, args.batch // max(1, args.parallel))
+    if args.parallel > 1 and "--max-connections" in supported:
+        print(f"[runner] Parallel={args.parallel} -> per-bench --max-connections={per_bench_batch} "
+              f"(total≈{per_bench_batch*args.parallel})", flush=True)
 
-    try:
-        for bench in tasks:
-            if CANCEL_REQUESTED:
-                print("[runner] Cancellation requested: skipping remaining tasks.")
-                break
+    def effective_max_tokens(name: str) -> Optional[int]:
+        if args.max_tokens is not None:
+            return args.max_tokens
+        if args.fast:
+            return FAST_MAX_TOKENS.get(name)
+        return None
 
-            task_file = out_dir / f"{bench}.json"
-            if args.resume and task_file.exists():
-                print(f"[runner] Skipping {bench} (resume: found {task_file})")
-                with open(task_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                consolidated["results"][bench] = data
-                table_rows.append(summarize_for_table(bench, data))
-                continue
-
-            if bench in GRADER_HEAVY and not os.environ.get("OPENAI_API_KEY"):
-                print(f"[warn] {bench} typically uses an OpenAI grader by default — OPENAI_API_KEY not set. "
-                      f"Consider exporting it or overriding the grader; continuing anyway.")
-
-            data = run_one_bench(
-                bench_name=bench,
+    def do_one(bench_name: str):
+        nonlocal exit_code
+        if CANCEL_REQUESTED:
+            return
+        # resume?
+        existing = out_dir / f"{bench_name}.eval.json"
+        if args.resume and existing.exists():
+            try:
+                data = json.loads(existing.read_text(encoding="utf-8"))
+                with lock:
+                    consolidated["results"][bench_name] = data
+                    rows.append(summarize_row(bench_name, data))
+                print(f"[runner] Resume: loaded {bench_name} from {existing}")
+                return
+            except Exception:
+                pass
+        t0 = time.time()
+        try:
+            data = run_bench(
+                supported=supported,
+                bench_cmd=args.bench_cmd,
+                bench_name=bench_name,
                 model=args.model,
                 base_url=args.base_url,
                 out_dir=out_dir,
-                batch=args.batch,
+                batch=per_bench_batch if "--max-connections" in supported else args.batch,
                 temperature=args.temperature,
                 top_p=args.top_p,
-                max_tokens=args.max_tokens,
+                max_tokens=effective_max_tokens(bench_name),
                 seed=args.seed,
                 limit=args.limit,
                 extra_model_args=args.extra_model_arg,
-                per_task_overrides=per_task_overrides,
                 timeout_s=args.timeout,
+                openai_api_key=args.openai_api_key,
             )
-            consolidated["results"][bench] = data
-            table_rows.append(summarize_for_table(bench, data))
+            dt = time.time() - t0
+            with lock:
+                consolidated["results"][bench_name] = data
+                rows.append(summarize_row(bench_name, data))
+            print(f"[runner] {bench_name} finished in {dt:.1f}s")
+        except KeyboardInterrupt:
+            print("[runner] Interrupted by user.")
+            exit_code = 130
+        except Exception as e:
+            with lock:
+                exit_code = 1
+                consolidated["errors"][bench_name] = str(e)
+            print(f"[error] {bench_name}: {e}", file=sys.stderr)
 
-    except KeyboardInterrupt:
-        print("[runner] Interrupted by user.")
-    finally:
-        # Write consolidated artifacts
-        consolidated_path = out_dir / "consolidated.json"
-        with open(consolidated_path, "w", encoding="utf-8") as f:
-            json.dump(consolidated, f, ensure_ascii=False, indent=2)
+    if args.parallel <= 1:
+        for bench_name in tasks:
+            if CANCEL_REQUESTED:
+                print("[runner] Cancel requested: skipping remaining tasks.")
+                break
+            do_one(bench_name)
+    else:
+        with ThreadPoolExecutor(max_workers=args.parallel) as ex:
+            futs = [ex.submit(do_one, t) for t in tasks]
+            for _ in as_completed(futs):
+                if CANCEL_REQUESTED:
+                    break
 
-        md_path = out_dir / "results.md"
-        write_markdown_table(table_rows, md_path)
-
-        print(f"\n[runner] Wrote consolidated JSON: {consolidated_path}")
-        print(f"[runner] Wrote Markdown table:     {md_path}\n")
-
-        if CANCEL_REQUESTED:
-            print("[runner] Note: run was cancelled mid-stream; some tasks may be missing or partial.")
-        sys.exit(0)
+    consolidated_name = f"consolidated_{args.model.replace("/", "_")}.json"
+    results_name = f"results_{args.model.replace("/", "_")}.md"
+    # Always write artifacts
+    (out_dir / consolidated_name).write_text(
+        json.dumps(consolidated, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    write_md(rows, out_dir / results_name)
+    print(f"\n[runner] Wrote: {out_dir/consolidated_name}")
+    print(f"[runner] Wrote: {out_dir/results_name}")
+    if consolidated["errors"]:
+        print("[runner] Some tasks failed. Check per-task logs (*.stderr.log) and consolidated.json:errors.")
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()

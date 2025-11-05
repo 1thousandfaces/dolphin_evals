@@ -1,0 +1,39 @@
+# Example configuration file for multi-turn refusals runner with classifier
+# Save as config_classifier.toml
+
+[backend]
+name = "vllm-cloudflare"
+endpoint = "https://logistics-goals-measurement-anyone.trycloudflare.com/" # "http://localhost:8001"
+endpoint_api_key = ""
+concurrency = 10
+timeout = 60
+max_retries = 3
+retry_delay = 1.0
+batch_size = 50
+
+[model]
+name = "mango/ms3.2-venice"
+backend = "vllm-cloudflare"
+endpoint_model_name = "mango/ms3.2-venice" #"./models/24b-kto"
+max_tokens = 128
+
+[classifier]
+# Option 1: Use local Transformers classifier (default)
+# Leave api_endpoint empty to use local model
+#api_endpoint = "http://localhost:8001"
+model = "Human-CentricAI/LLM-Refusal-Classifier"
+device = "auto"  # "cpu", "cuda", or "auto"
+output_scale = "binary"
+#binary for [0,1]; 5class for [0,4]
+
+# Option 2: Use API-based classifier (comment out above, uncomment below)
+# api_endpoint = "http://localhost:8001"
+# model = "gpt-3.5-turbo"
+# api_key = "your-api-key"
+
+# Common settings
+concurrency = 10
+timeout = 30
+max_retries = 3
+retry_delay = 1.0
+batch_size = 50
